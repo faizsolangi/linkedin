@@ -2,15 +2,24 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import time
 
 # Function to extract chart data from the article
 def extract_charts(url):
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return None, f"Failed to fetch article: HTTP {response.status_code}"
+        # Set up Selenium with headless Chrome
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        driver = webdriver.Chrome(options=chrome_options)
         
-        soup = BeautifulSoup(response.text, 'html.parser')
+        driver.get(url)
+        time.sleep(3)  # Wait for JavaScript to load
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        driver.quit()
         
         # Try multiple selectors for article body
         selectors = [
@@ -19,7 +28,9 @@ def extract_charts(url):
             ('div', {'class': 'article-body'}),
             ('article', {}),
             ('div', {'id': 'main-content'}),
-            ('div', {'class': 'blog-post-content'})
+            ('div', {'class': 'blog-post-content'}),
+            ('div', {'class': 'entry-content'}),  # Common for WordPress
+            ('div', {'class': 'post-body'})
         ]
         
         article_body = None
@@ -29,34 +40,44 @@ def extract_charts(url):
                 break
         
         if not article_body:
-            return None, (
+            return None, [], (
                 "Could not find article body. Please inspect the website's HTML to identify the correct container "
-                "(e.g., <div class='content'> or <article>). Common classes include 'content', 'article', "
-                "'post-body', or 'blog-post-content'. Provide the correct class to update the script."
+                "(e.g., <div class='entry-content'> or <article>). Common classes include 'content', 'article', "
+                "'post-body', or 'entry-content'. Provide the correct class to update the script."
             )
         
-        # Charts: find img tags that look like charts
+        # Collect all images for debugging
+        all_images = []
         charts = []
-        for img in article_body.find_all('img'):
-            image_url = img.get('src')
+        for img in article_body.find_all(['img', 'figure']):
+            image_url = None
+            alt_text = ''
+            tag_name = img.name
+            
+            if tag_name == 'img':
+                image_url = img.get('src')
+                alt_text = img.get('alt', '')
+            elif tag_name == 'figure':
+                img_tag = img.find('img')
+                if img_tag:
+                    image_url = img_tag.get('src')
+                    alt_text = img_tag.get('alt', '')
+            
             if not image_url:
                 continue
             if not image_url.startswith('http'):
-                image_url = requests.compat.urljoin(url, image_url)  # Make absolute
-            
-            alt_text = img.get('alt', '')
+                image_url = requests.compat.urljoin(url, image_url)
             
             # Caption: look for figcaption or next sibling p
             caption = ''
-            figcaption = img.find_parent('figure')
-            if figcaption:
-                cap = figcaption.find('figcaption')
+            if tag_name == 'figure':
+                cap = img.find('figcaption')
                 if cap:
                     caption = cap.get_text(strip=True)
             else:
                 next_p = img.find_next('p')
                 if next_p:
-                    caption = next_p.get_text(strip=True)[:100]  # Truncate if too long
+                    caption = next_p.get_text(strip=True)[:100]
             
             # Context text: previous and next sibling text
             context_text = ''
@@ -71,18 +92,28 @@ def extract_charts(url):
                 if parent:
                     context_text = ' '.join(parent.stripped_strings)[:200]
             
+            # Store all images for debugging
+            all_images.append({
+                "image_url": image_url,
+                "alt_text": alt_text,
+                "caption": caption,
+                "context_text": context_text,
+                "tag": tag_name
+            })
+            
             # Filter if it's a chart
+            keywords = ['chart', 'graph', 'scatter', 'visualization', 'figure', 'data', 'plot', 'diagram']
             if any(keyword in alt_text.lower() or keyword in caption.lower() or keyword in image_url.lower() 
-                   for keyword in ['chart', 'graph', 'scatter', 'visualization']):
+                   for keyword in keywords):
                 charts.append({
                     "image_url": image_url,
                     "caption": caption,
                     "context_text": context_text
                 })
         
-        return charts, None
+        return charts, all_images, None
     except Exception as e:
-        return None, f"Error fetching or parsing article: {str(e)}"
+        return None, [], f"Error fetching or parsing article: {str(e)}"
 
 # Streamlit app
 st.title("Article Chart Extractor")
@@ -98,11 +129,26 @@ if submit_button:
         st.error("Please provide a valid URL")
     else:
         with st.spinner("Extracting charts..."):
-            charts, error = extract_charts(url)
+            charts, all_images, error = extract_charts(url)
             if error:
                 st.error(error)
             elif not charts:
-                st.warning("No charts found in the article. This may occur if the article has no images tagged as charts or if the HTML structure differs from expected.")
+                st.warning(
+                    "No charts found in the article. This may occur if images lack chart-related keywords "
+                    "(e.g., 'chart', 'graph', 'scatter', 'figure') in alt text, captions, or URLs, "
+                    "or if the HTML structure differs from expected."
+                )
+                # Show all images for debugging
+                if all_images:
+                    st.subheader("All Detected Images (Debug)")
+                    df_images = pd.DataFrame(all_images)
+                    st.dataframe(df_images, use_container_width=True, column_config={
+                        "image_url": st.column_config.LinkColumn("Image URL", display_text="View Image"),
+                        "alt_text": "Alt Text",
+                        "caption": "Caption",
+                        "context_text": "Context Text",
+                        "tag": "HTML Tag"
+                    })
             else:
                 st.success(f"Found {len(charts)} charts!")
                 # Display charts in a table
@@ -110,8 +156,12 @@ if submit_button:
                 st.dataframe(df, use_container_width=True, column_config={
                     "image_url": st.column_config.LinkColumn("Image URL", display_text="View Image")
                 })
-                # Optionally display images (uncomment if image URLs are valid)
+                # Optionally display images (uncomment if URLs are valid)
                 # for chart in charts:
                 #     st.image(chart['image_url'], caption=chart['caption'], use_column_width=True)
 
-st.markdown("**Note**: If no charts are found or an error occurs, inspect the website's HTML to confirm the article body container class or tag. Contact support for assistance.")
+st.markdown(
+    "**Troubleshooting**: If no charts are found, check the 'All Detected Images' table for clues. "
+    "Inspect the website's HTML to confirm chart image tags (e.g., <img> or <figure>) and their attributes. "
+    "Share the HTML structure or correct container class for further assistance."
+)
