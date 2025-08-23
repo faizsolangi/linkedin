@@ -17,7 +17,7 @@ def extract_charts(url):
         driver = webdriver.Chrome(options=chrome_options)
         
         driver.get(url)
-        time.sleep(5)  # Wait for dynamic content
+        time.sleep(3)  # Wait for JavaScript to load
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         driver.quit()
         
@@ -29,9 +29,8 @@ def extract_charts(url):
             ('article', {}),
             ('div', {'id': 'main-content'}),
             ('div', {'class': 'blog-post-content'}),
-            ('div', {'class': 'entry-content'}),
-            ('div', {'class': 'post-body'}),
-            ('section', {'class': 'content'})
+            ('div', {'class': 'entry-content'}),  # Common for WordPress
+            ('div', {'class': 'post-body'})
         ]
         
         article_body = None
@@ -44,94 +43,75 @@ def extract_charts(url):
             return None, [], (
                 "Could not find article body. Please inspect the website's HTML to identify the correct container "
                 "(e.g., <div class='entry-content'> or <article>). Common classes include 'content', 'article', "
-                "'post-body', 'entry-content', or 'blog-post-content'. Provide the HTML snippet for assistance."
+                "'post-body', or 'entry-content'. Provide the correct class to update the script."
             )
         
-        # Collect all potential chart elements
-        all_elements = []
+        # Collect all images for debugging
+        all_images = []
         charts = []
-        chart_keywords = ['chart', 'graph', 'scatter', 'visualization', 'figure', 'data', 'plot', 'diagram', 'infographic', 'statistic', 'flourish']
-        
-        # Check <img>, <figure>, <canvas>, <svg>, and <iframe>
-        for element in article_body.find_all(['img', 'figure', 'canvas', 'svg', 'iframe']):
-            element_type = element.name
+        for img in article_body.find_all(['img', 'figure']):
             image_url = None
             alt_text = ''
-            class_attr = element.get('class', [])
-            class_str = ' '.join(class_attr) if class_attr else ''
+            tag_name = img.name
             
-            if element_type == 'img':
-                image_url = element.get('src')
-                alt_text = element.get('alt', '')
-            elif element_type == 'figure':
-                img_tag = element.find('img')
+            if tag_name == 'img':
+                image_url = img.get('src')
+                alt_text = img.get('alt', '')
+            elif tag_name == 'figure':
+                img_tag = img.find('img')
                 if img_tag:
                     image_url = img_tag.get('src')
                     alt_text = img_tag.get('alt', '')
-            elif element_type in ['canvas', 'svg', 'iframe']:
-                image_url = element.get('src', '') or element.get('data-src', '') or f"{element_type}_element_{id(element)}"
             
-            if not image_url and element_type not in ['canvas', 'svg', 'iframe']:
+            if not image_url:
                 continue
-            if image_url and not image_url.startswith('http') and element_type != 'iframe':
+            if not image_url.startswith('http'):
                 image_url = requests.compat.urljoin(url, image_url)
             
-            # Caption: look for figcaption, nearby p, h3/h4, or parent div text
+            # Caption: look for figcaption or next sibling p
             caption = ''
-            if element_type == 'figure':
-                cap = element.find('figcaption')
+            if tag_name == 'figure':
+                cap = img.find('figcaption')
                 if cap:
                     caption = cap.get_text(strip=True)
-            if not caption:
-                for tag in ['p', 'h3', 'h4', 'div']:
-                    next_elem = element.find_next(tag)
-                    if next_elem and next_elem.get_text(strip=True):
-                        caption = next_elem.get_text(strip=True)[:100]
-                        break
-                else:
-                    prev_elem = element.find_previous(['p', 'h3', 'h4', 'div'])
-                    if prev_elem and prev_elem.get_text(strip=True):
-                        caption = prev_elem.get_text(strip=True)[:100]
+            else:
+                next_p = img.find_next('p')
+                if next_p:
+                    caption = next_p.get_text(strip=True)[:100]
             
-            # Context text: broader context from surrounding elements
+            # Context text: previous and next sibling text
             context_text = ''
-            for sibling in [element.previous_sibling, element.next_sibling]:
-                if sibling and sibling.string:
-                    context_text += sibling.string.strip() + ' '
+            prev = img.previous_sibling
+            if prev and prev.string:
+                context_text += prev.string.strip() + ' '
+            next_sib = img.next_sibling
+            if next_sib and next_sib.string:
+                context_text += next_sib.string.strip()
             if not context_text:
-                parent = element.parent
+                parent = img.parent
                 if parent:
                     context_text = ' '.join(parent.stripped_strings)[:200]
             
-            # Store all elements for debugging
-            all_elements.append({
-                "element_type": element_type,
-                "image_url": image_url or f"{element_type}_no_url",
+            # Store all images for debugging
+            all_images.append({
+                "image_url": image_url,
                 "alt_text": alt_text,
                 "caption": caption,
                 "context_text": context_text,
-                "class": class_str
+                "tag": tag_name
             })
             
-            # Filter if it's a chart, with special handling for Flourish iframes
-            if any(keyword in (alt_text.lower() + caption.lower() + image_url.lower() + class_str.lower()) 
-                   for keyword in chart_keywords) or 'flourish.studio' in image_url.lower():
+            # Filter if it's a chart
+            keywords = ['chart', 'graph', 'scatter', 'visualization', 'figure', 'data', 'plot', 'diagram']
+            if any(keyword in alt_text.lower() or keyword in caption.lower() or keyword in image_url.lower() 
+                   for keyword in keywords):
                 charts.append({
-                    "image_url": image_url or f"{element_type}_element",
-                    "caption": caption,
-                    "context_text": context_text
-                })
-            # Fallback: check context text for document captions
-            elif any(keyword in context_text.lower() for keyword in chart_keywords + [
-                'issues facing the eu', 'issues facing your country', 'climate vs immediate', 'seat projections'
-            ]):
-                charts.append({
-                    "image_url": image_url or f"{element_type}_element",
+                    "image_url": image_url,
                     "caption": caption,
                     "context_text": context_text
                 })
         
-        return charts, all_elements, None
+        return charts, all_images, None
     except Exception as e:
         return None, [], f"Error fetching or parsing article: {str(e)}"
 
@@ -149,42 +129,39 @@ if submit_button:
         st.error("Please provide a valid URL")
     else:
         with st.spinner("Extracting charts..."):
-            charts, all_elements, error = extract_charts(url)
+            charts, all_images, error = extract_charts(url)
             if error:
                 st.error(error)
             elif not charts:
                 st.warning(
-                    "No charts found in the article. This may occur if elements lack chart-related keywords "
-                    "(e.g., 'chart', 'graph', 'scatter', 'figure', 'data', 'plot', 'diagram', 'infographic', 'statistic', 'flourish') "
-                    "in alt text, captions, URLs, or classes, or if charts use non-standard HTML (e.g., <iframe> for Flourish visualizations)."
+                    "No charts found in the article. This may occur if images lack chart-related keywords "
+                    "(e.g., 'chart', 'graph', 'scatter', 'figure') in alt text, captions, or URLs, "
+                    "or if the HTML structure differs from expected."
                 )
-                # Show all detected elements for debugging
-                if all_elements:
-                    st.subheader("All Detected Elements (Debug)")
-                    df_elements = pd.DataFrame(all_elements)
-                    st.dataframe(df_elements, use_container_width=True, column_config={
-                        "image_url": st.column_config.LinkColumn("Image URL", display_text="View"),
-                        "element_type": "Element Type",
+                # Show all images for debugging
+                if all_images:
+                    st.subheader("All Detected Images (Debug)")
+                    df_images = pd.DataFrame(all_images)
+                    st.dataframe(df_images, use_container_width=True, column_config={
+                        "image_url": st.column_config.LinkColumn("Image URL", display_text="View Image"),
                         "alt_text": "Alt Text",
                         "caption": "Caption",
                         "context_text": "Context Text",
-                        "class": "Class"
+                        "tag": "HTML Tag"
                     })
             else:
                 st.success(f"Found {len(charts)} charts!")
                 # Display charts in a table
                 df = pd.DataFrame(charts)
                 st.dataframe(df, use_container_width=True, column_config={
-                    "image_url": st.column_config.LinkColumn("Image URL", display_text="View")
+                    "image_url": st.column_config.LinkColumn("Image URL", display_text="View Image")
                 })
-                # Display images for valid URLs
-                for chart in charts:
-                    if chart['image_url'].startswith('http'):
-                        st.image(chart['image_url'], caption=chart['caption'], use_column_width=True)
+                # Optionally display images (uncomment if URLs are valid)
+                # for chart in charts:
+                #     st.image(chart['image_url'], caption=chart['caption'], use_column_width=True)
 
 st.markdown(
-    "**Troubleshooting**: If no charts are found, check the 'All Detected Elements' table. "
-    "Inspect the website's HTML (right-click a chart, select 'Inspect') to confirm chart elements (e.g., <iframe src='https://public.flourish.studio/...'>). "
-    "Share the HTML snippet, including tags, classes, or attributes, or the debug table output for precise adjustments. "
-    "Contact support at [email@example.com] for assistance."
+    "**Troubleshooting**: If no charts are found, check the 'All Detected Images' table for clues. "
+    "Inspect the website's HTML to confirm chart image tags (e.g., <img> or <figure>) and their attributes. "
+    "Share the HTML structure or correct container class for further assistance."
 )
