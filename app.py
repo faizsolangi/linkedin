@@ -12,8 +12,11 @@ def extract_charts(url):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url)
-            # Wait for Flourish iframes or timeout after 15s
-            page.wait_for_selector("iframe[src*='flourish.studio'], div[class*='flourish']", timeout=15000)
+            # Simulate scrolling to trigger lazy-loading
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)  # Wait after scroll
+            # Wait for Flourish embeds or timeout after 20s
+            page.wait_for_selector("iframe[src*='flourish.studio'], div[class*='flourish'], script[src*='flourish.studio']", timeout=20000)
             soup = BeautifulSoup(page.content(), 'html.parser')
             browser.close()
         
@@ -48,12 +51,12 @@ def extract_charts(url):
         charts = []
         html_snippets = []
         chart_keywords = [
-            'chart', 'graph', 'scatter', 'visualization', 'figure', 'data', 'plot', 
-            'diagram', 'infographic', 'statistic', 'flourish', 'eurobarometer', 
-            'seat projection', 'issues facing', 'climate vs'
+            'chart', 'graph', 'scatter', 'visualization', 'visualisation', 'figure', 'data', 'plot', 
+            'diagram', 'infographic', 'statistic', 'flourish', 'eurobarometer', 'seat projection', 
+            'issues facing', 'climate vs', 'most important issues'
         ]
         
-        # Check <img>, <figure>, <canvas>, <svg>, <iframe>, <div>, and <script>
+        # Check <img>, <figure>, <canvas>, <svg>, <iframe>, <div>, <script>
         for element in article_body.find_all(['img', 'figure', 'canvas', 'svg', 'iframe', 'div', 'script']):
             element_type = element.name
             image_url = None
@@ -72,11 +75,12 @@ def extract_charts(url):
                     alt_text = img_tag.get('alt', '')
             elif element_type in ['canvas', 'svg', 'iframe']:
                 image_url = element.get('src', '') or element.get('data-src', '') or f"{element_type}_element_{id(element)}"
-            elif element_type == 'div' and any(c in class_str.lower() for c in ['flourish', 'chart', 'graph', 'visualization']):
+            elif element_type == 'div' and any(c in class_str.lower() for c in ['flourish', 'chart', 'graph', 'visualization', 'visualisation']):
                 image_url = element.get('data-src', '') or f"div_element_{id(element)}"
             elif element_type == 'script' and 'flourish.studio' in str(element):
-                image_url = re.search(r'(https://public\.flourish\.studio/[^\'"]+)', str(element))
-                image_url = image_url.group(1) if image_url else f"script_element_{id(element)}"
+                # Extract Flourish URL from script content or src
+                image_url = re.search(r'(https://public\.flourish\.studio/[^\'"\s]+)', str(element))
+                image_url = image_url.group(1) if image_url else element.get('src', f"script_element_{id(element)}")
             
             if not image_url and element_type not in ['canvas', 'svg', 'iframe', 'div', 'script']:
                 continue
@@ -85,19 +89,27 @@ def extract_charts(url):
             
             # Caption: broader search including nearby headings and divs
             caption = ''
-            for tag in ['figcaption', 'p', 'h3', 'h4', 'h5', 'div']:
-                next_elem = element.find_next(tag)
-                if next_elem and next_elem.get_text(strip=True):
-                    caption = next_elem.get_text(strip=True)[:100]
-                    break
-                prev_elem = element.find_previous(tag)
-                if prev_elem and prev_elem.get_text(strip=True):
-                    caption = prev_elem.get_text(strip=True)[:100]
+            for tag in ['figcaption', 'p', 'h3', 'h4', 'h5', 'h6', 'div']:
+                for i in range(1, 4):  # Check up to 3 elements away
+                    next_elem = element
+                    prev_elem = element
+                    for _ in range(i):
+                        if next_elem:
+                            next_elem = next_elem.find_next(tag)
+                        if prev_elem:
+                            prev_elem = prev_elem.find_previous(tag)
+                    if next_elem and next_elem.get_text(strip=True):
+                        caption = next_elem.get_text(strip=True)[:150]
+                        break
+                    if prev_elem and prev_elem.get_text(strip=True):
+                        caption = prev_elem.get_text(strip=True)[:150]
+                        break
+                if caption:
                     break
             
-            # Context text: include parent and grandparent text
+            # Context text: include broader range and parent/grandparent text
             context_text = ''
-            for i in range(1, 4):  # Check 3 elements before/after
+            for i in range(1, 5):  # Check 4 elements before/after
                 prev_sib = element
                 next_sib = element
                 for _ in range(i):
@@ -112,14 +124,15 @@ def extract_charts(url):
             if not context_text:
                 parent = element.parent
                 if parent:
-                    context_text = ' '.join(parent.stripped_strings)[:300]
+                    context_text = ' '.join(parent.stripped_strings)[:500]
                 grandparent = parent.parent if parent else None
                 if grandparent:
-                    context_text += ' ' + ' '.join(grandparent.stripped_strings)[:300]
+                    context_text += ' ' + ' '.join(grandparent.stripped_strings)[:500]
             
-            # Store HTML snippet with parent context
-            html_snippet = str(element.parent)[:1000]  # Include parent for context
-            if len(str(element.parent)) > 1000:
+            # Store HTML snippet with broader context
+            html_context = element.parent if element.parent else element
+            html_snippet = str(html_context)[:1500]  # Include parent context
+            if len(str(html_context)) > 1500:
                 html_snippet += '...'
             
             # Store all elements for debugging
@@ -169,10 +182,11 @@ if submit_button:
             elif not charts:
                 st.warning(
                     "No charts found in the article. This may occur if elements lack chart-related keywords "
-                    "(e.g., 'chart', 'graph', 'scatter', 'figure', 'data', 'plot', 'diagram', 'infographic', "
-                    "'statistic', 'flourish', 'eurobarometer', 'seat projection', 'issues facing', 'climate vs') "
-                    "in alt text, captions, URLs, classes, or data attributes, or if charts use non-standard HTML "
-                    "(e.g., <iframe> or <script> for Flourish visualizations)."
+                    "(e.g., 'chart', 'graph', 'scatter', 'visualization', 'visualisation', 'figure', 'data', 'plot', "
+                    "'diagram', 'infographic', 'statistic', 'flourish', 'eurobarometer', 'seat projection', "
+                    "'issues facing', 'climate vs', 'most important issues') in alt text, captions, URLs, classes, "
+                    "or data attributes, or if charts use non-standard HTML (e.g., <iframe>, <div>, or <script> for "
+                    "Flourish visualizations)."
                 )
                 # Show all detected elements for debugging
                 if all_elements:
@@ -208,6 +222,6 @@ if submit_button:
 st.markdown(
     "**Troubleshooting**: Check the 'All Detected Elements' table and 'HTML Snippets' section. "
     "Inspect the website's HTML (right-click a chart, select 'Inspect') to confirm chart elements "
-    "(e.g., <iframe src='https://public.flourish.studio/...'> or <div class='flourish-embed'>). "
+    "(e.g., <iframe src='https://public.flourish.studio/...'>, <div class='flourish-embed'>, or <script>). "
     "Share the HTML snippet, debug table output, or contact support at [email@example.com] for assistance."
 )
