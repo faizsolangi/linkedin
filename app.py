@@ -12,7 +12,8 @@ def extract_charts(url):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url)
-            page.wait_for_timeout(10000)  # 10s for dynamic content
+            # Wait for Flourish iframes or timeout after 15s
+            page.wait_for_selector("iframe[src*='flourish.studio'], div[class*='flourish']", timeout=15000)
             soup = BeautifulSoup(page.content(), 'html.parser')
             browser.close()
         
@@ -48,16 +49,18 @@ def extract_charts(url):
         html_snippets = []
         chart_keywords = [
             'chart', 'graph', 'scatter', 'visualization', 'figure', 'data', 'plot', 
-            'diagram', 'infographic', 'statistic', 'flourish', 'eurobarometer', 'seat projection'
+            'diagram', 'infographic', 'statistic', 'flourish', 'eurobarometer', 
+            'seat projection', 'issues facing', 'climate vs'
         ]
         
-        # Check <img>, <figure>, <canvas>, <svg>, <iframe>, and <div> with chart classes
-        for element in article_body.find_all(['img', 'figure', 'canvas', 'svg', 'iframe', 'div']):
+        # Check <img>, <figure>, <canvas>, <svg>, <iframe>, <div>, and <script>
+        for element in article_body.find_all(['img', 'figure', 'canvas', 'svg', 'iframe', 'div', 'script']):
             element_type = element.name
             image_url = None
             alt_text = ''
             class_attr = element.get('class', [])
             class_str = ' '.join(class_attr) if class_attr else ''
+            data_attrs = ' '.join(f"{k}={v}" for k, v in element.attrs.items() if k.startswith('data-'))
             
             if element_type == 'img':
                 image_url = element.get('src')
@@ -71,15 +74,18 @@ def extract_charts(url):
                 image_url = element.get('src', '') or element.get('data-src', '') or f"{element_type}_element_{id(element)}"
             elif element_type == 'div' and any(c in class_str.lower() for c in ['flourish', 'chart', 'graph', 'visualization']):
                 image_url = element.get('data-src', '') or f"div_element_{id(element)}"
+            elif element_type == 'script' and 'flourish.studio' in str(element):
+                image_url = re.search(r'(https://public\.flourish\.studio/[^\'"]+)', str(element))
+                image_url = image_url.group(1) if image_url else f"script_element_{id(element)}"
             
-            if not image_url and element_type not in ['canvas', 'svg', 'iframe', 'div']:
+            if not image_url and element_type not in ['canvas', 'svg', 'iframe', 'div', 'script']:
                 continue
             if image_url and not image_url.startswith('http') and element_type != 'iframe':
                 image_url = requests.compat.urljoin(url, image_url)
             
-            # Caption: broader search for nearby text
+            # Caption: broader search including nearby headings and divs
             caption = ''
-            for tag in ['figcaption', 'p', 'h3', 'h4', 'div']:
+            for tag in ['figcaption', 'p', 'h3', 'h4', 'h5', 'div']:
                 next_elem = element.find_next(tag)
                 if next_elem and next_elem.get_text(strip=True):
                     caption = next_elem.get_text(strip=True)[:100]
@@ -89,9 +95,9 @@ def extract_charts(url):
                     caption = prev_elem.get_text(strip=True)[:100]
                     break
             
-            # Context text: broader range
+            # Context text: include parent and grandparent text
             context_text = ''
-            for i in range(1, 3):  # Check 2 elements before/after
+            for i in range(1, 4):  # Check 3 elements before/after
                 prev_sib = element
                 next_sib = element
                 for _ in range(i):
@@ -106,11 +112,14 @@ def extract_charts(url):
             if not context_text:
                 parent = element.parent
                 if parent:
-                    context_text = ' '.join(parent.stripped_strings)[:200]
+                    context_text = ' '.join(parent.stripped_strings)[:300]
+                grandparent = parent.parent if parent else None
+                if grandparent:
+                    context_text += ' ' + ' '.join(grandparent.stripped_strings)[:300]
             
-            # Store HTML snippet for debugging
-            html_snippet = str(element)[:500]  # Limit to 500 chars
-            if len(str(element)) > 500:
+            # Store HTML snippet with parent context
+            html_snippet = str(element.parent)[:1000]  # Include parent for context
+            if len(str(element.parent)) > 1000:
                 html_snippet += '...'
             
             # Store all elements for debugging
@@ -121,12 +130,13 @@ def extract_charts(url):
                 "caption": caption,
                 "context_text": context_text,
                 "class": class_str,
+                "data_attrs": data_attrs,
                 "html_snippet": html_snippet
             })
             
             # Filter if it's a chart
             text_to_check = (alt_text.lower() + caption.lower() + image_url.lower() + 
-                            class_str.lower() + context_text.lower())
+                            class_str.lower() + context_text.lower() + data_attrs.lower())
             if (any(keyword in text_to_check for keyword in chart_keywords) or 
                 'flourish.studio' in image_url.lower()):
                 charts.append({
@@ -160,8 +170,9 @@ if submit_button:
                 st.warning(
                     "No charts found in the article. This may occur if elements lack chart-related keywords "
                     "(e.g., 'chart', 'graph', 'scatter', 'figure', 'data', 'plot', 'diagram', 'infographic', "
-                    "'statistic', 'flourish', 'eurobarometer', 'seat projection') in alt text, captions, URLs, "
-                    "or classes, or if charts use non-standard HTML (e.g., <iframe> for Flourish visualizations)."
+                    "'statistic', 'flourish', 'eurobarometer', 'seat projection', 'issues facing', 'climate vs') "
+                    "in alt text, captions, URLs, classes, or data attributes, or if charts use non-standard HTML "
+                    "(e.g., <iframe> or <script> for Flourish visualizations)."
                 )
                 # Show all detected elements for debugging
                 if all_elements:
@@ -174,6 +185,7 @@ if submit_button:
                         "caption": "Caption",
                         "context_text": "Context Text",
                         "class": "Class",
+                        "data_attrs": "Data Attributes",
                         "html_snippet": "HTML Snippet"
                     })
                 # Show HTML snippets
@@ -194,7 +206,8 @@ if submit_button:
                         st.image(chart['image_url'], caption=chart['caption'], use_column_width=True)
 
 st.markdown(
-    "**Troubleshooting**: If no charts are found, check the 'All Detected Elements' table and 'HTML Snippets' section. "
-    "Inspect the website's HTML (right-click a chart, select 'Inspect') to confirm chart elements (e.g., <iframe src='https://public.flourish.studio/...'>). "
+    "**Troubleshooting**: Check the 'All Detected Elements' table and 'HTML Snippets' section. "
+    "Inspect the website's HTML (right-click a chart, select 'Inspect') to confirm chart elements "
+    "(e.g., <iframe src='https://public.flourish.studio/...'> or <div class='flourish-embed'>). "
     "Share the HTML snippet, debug table output, or contact support at [email@example.com] for assistance."
 )
